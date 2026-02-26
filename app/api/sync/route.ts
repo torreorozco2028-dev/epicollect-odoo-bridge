@@ -88,73 +88,70 @@ if ( !entries || entries.length < 1) {
     })
 
     const fieldCheckData = await fieldCheckRes.json()
+    console.log("Verificación del campo x_epicollect_uuid en Odoo:", fieldCheckData)
     const hasEpicollectUuidField = Boolean(
       fieldCheckData?.result && fieldCheckData.result.x_epicollect_uuid
     )
     console.log("Campo x_epicollect_uuid disponible:", hasEpicollectUuidField)
 
+    if (!hasEpicollectUuidField) {
+      return NextResponse.json(
+        { error: "El campo x_epicollect_uuid no existe en crm.lead" },
+        { status: 400 }
+      )
+    }
+
     let created = 0
+    let duplicated = 0
+    let skippedWithoutUuid = 0
     const sellerCache = new Map<string, number | null>()
 
     for (const entry of entries) {
 
       const email = entry?.["5_EmailVendedor"]
-      const phone = entry?.["2_Telefono"]
-      let duplicateDomain: unknown[] | null = null
+      const ec5Uuid = entry?.ec5_uuid
 
-      if (hasEpicollectUuidField && entry?.ec5_uuid) {
-        duplicateDomain = [["x_epicollect_uuid", "=", entry.ec5_uuid]]
-      } else if (email && phone) {
-        duplicateDomain = [
-          "|",
-          ["email_from", "=", email],
-          ["phone", "=", phone],
-        ]
-      } else if (email) {
-        duplicateDomain = [["email_from", "=", email]]
-      } else if (phone) {
-        duplicateDomain = [["phone", "=", phone]]
+      if (!ec5Uuid) {
+        skippedWithoutUuid++
+        continue
       }
 
-      let duplicatedIds: number[] = []
+      // 🔎 Verificar duplicado solo por UUID
+      const checkRes = await fetch(`${ODOO_URL}/jsonrpc`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "call",
+          params: {
+            service: "object",
+            method: "execute_kw",
+            args: [
+              ODOO_DB,
+              uid,
+              ODOO_PASSWORD,
+              "crm.lead",
+              "search",
+              [[["x_epicollect_uuid", "=", ec5Uuid]]],
+              { limit: 1 },
+            ],
+          },
+          id: 2,
+        }),
+      })
 
-      if (duplicateDomain) {
+      const checkData = await checkRes.json()
+      console.log("Verificación de duplicado:", checkData)
 
-        // 🔎 Verificar duplicado
-        const checkRes = await fetch(`${ODOO_URL}/jsonrpc`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "call",
-            params: {
-              service: "object",
-              method: "execute_kw",
-              args: [
-                ODOO_DB,
-                uid,
-                ODOO_PASSWORD,
-                "crm.lead",
-                "search",
-                [duplicateDomain],
-                { limit: 1 },
-              ],
-            },
-            id: 2,
-          }),
-        })
-
-        const checkData = await checkRes.json()
-        console.log("Verificación de duplicado:", checkData)
-
-        if (checkData?.error) {
-          throw new Error(checkData.error?.data?.message || checkData.error?.message || "Error verificando duplicado en Odoo")
-        }
-
-        duplicatedIds = Array.isArray(checkData?.result) ? checkData.result : []
+      if (checkData?.error) {
+        throw new Error(checkData.error?.data?.message || checkData.error?.message || "Error verificando duplicado en Odoo")
       }
 
-      if (duplicatedIds.length > 0) continue
+      const duplicatedIds = Array.isArray(checkData?.result) ? checkData.result : []
+      if (duplicatedIds.length > 0) {
+        duplicated++
+        continue
+      }
 
       let sellerId: number | null = null
       if (email) {
@@ -205,9 +202,7 @@ if ( !entries || entries.length < 1) {
         email_from: entry["5_EmailVendedor"],
       }
 
-      if (hasEpicollectUuidField) {
-        leadPayload.x_epicollect_uuid = entry.ec5_uuid
-      }
+      leadPayload.x_epicollect_uuid = ec5Uuid
 
       if (sellerId) {
         leadPayload.user_id = sellerId
@@ -247,6 +242,8 @@ if ( !entries || entries.length < 1) {
       success: true,
       totalProcesados: entries.length,
       creados: created,
+      duplicados: duplicated,
+      omitidosSinUuid: skippedWithoutUuid,
     })
 
   } catch (error: any) {
