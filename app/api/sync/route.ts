@@ -30,8 +30,8 @@ export async function POST(req: NextRequest) {
  const entries = epiData && epiData.data && Array.isArray(epiData.data.entries)
   ? epiData.data.entries
   : []
-
-if (!entries.length) {
+console.log("Entries extraídas:", entries)
+if ( !entries || entries.length < 1) {
   return NextResponse.json({ message: "No hay registros nuevos" })
 }
 
@@ -57,46 +57,163 @@ if (!entries.length) {
     })
 
     const authData = await authRes.json()
+    console.log("Autenticación en Odoo:", authData)
     const uid = authData.result
 
     if (!uid) {
       return NextResponse.json({ error: "Error autenticando en Odoo" }, { status: 401 })
     }
 
+    const fieldCheckRes = await fetch(`${ODOO_URL}/jsonrpc`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "call",
+        params: {
+          service: "object",
+          method: "execute_kw",
+          args: [
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "crm.lead",
+            "fields_get",
+            [["x_epicollect_uuid"]],
+            { attributes: ["type"] },
+          ],
+        },
+        id: 10,
+      }),
+    })
+
+    const fieldCheckData = await fieldCheckRes.json()
+    const hasEpicollectUuidField = Boolean(
+      fieldCheckData?.result && fieldCheckData.result.x_epicollect_uuid
+    )
+    console.log("Campo x_epicollect_uuid disponible:", hasEpicollectUuidField)
+
     let created = 0
+    const sellerCache = new Map<string, number | null>()
 
     for (const entry of entries) {
 
-      // 🔎 Verificar duplicado por UUID
-      const checkRes = await fetch(`${ODOO_URL}/jsonrpc`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "call",
-          params: {
-            service: "object",
-            method: "execute_kw",
-            args: [
-              ODOO_DB,
-              uid,
-              ODOO_PASSWORD,
-              "crm.lead",
-              "search",
-              [[["x_epicollect_uuid", "=", entry.ec5_uuid]]],
-              { limit: 1 },
-            ],
-          },
-          id: 2,
-        }),
-      })
+      const email = entry?.["5_EmailVendedor"]
+      const phone = entry?.["2_Telefono"]
+      let duplicateDomain: unknown[] | null = null
 
-      const checkData = await checkRes.json()
+      if (hasEpicollectUuidField && entry?.ec5_uuid) {
+        duplicateDomain = [["x_epicollect_uuid", "=", entry.ec5_uuid]]
+      } else if (email && phone) {
+        duplicateDomain = [
+          "|",
+          ["email_from", "=", email],
+          ["phone", "=", phone],
+        ]
+      } else if (email) {
+        duplicateDomain = [["email_from", "=", email]]
+      } else if (phone) {
+        duplicateDomain = [["phone", "=", phone]]
+      }
 
-      if (checkData.result.length > 0) continue
+      let duplicatedIds: number[] = []
+
+      if (duplicateDomain) {
+
+        // 🔎 Verificar duplicado
+        const checkRes = await fetch(`${ODOO_URL}/jsonrpc`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "call",
+            params: {
+              service: "object",
+              method: "execute_kw",
+              args: [
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "crm.lead",
+                "search",
+                [duplicateDomain],
+                { limit: 1 },
+              ],
+            },
+            id: 2,
+          }),
+        })
+
+        const checkData = await checkRes.json()
+        console.log("Verificación de duplicado:", checkData)
+
+        if (checkData?.error) {
+          throw new Error(checkData.error?.data?.message || checkData.error?.message || "Error verificando duplicado en Odoo")
+        }
+
+        duplicatedIds = Array.isArray(checkData?.result) ? checkData.result : []
+      }
+
+      if (duplicatedIds.length > 0) continue
+
+      let sellerId: number | null = null
+      if (email) {
+        if (sellerCache.has(email)) {
+          sellerId = sellerCache.get(email) ?? null
+        } else {
+          const sellerRes = await fetch(`${ODOO_URL}/jsonrpc`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              method: "call",
+              params: {
+                service: "object",
+                method: "execute_kw",
+                args: [
+                  ODOO_DB,
+                  uid,
+                  ODOO_PASSWORD,
+                  "res.users",
+                  "search_read",
+                  [["|", ["login", "=", email], ["email", "=", email]]],
+                  { fields: ["id", "name"], limit: 1 },
+                ],
+              },
+              id: 20,
+            }),
+          })
+
+          const sellerData = await sellerRes.json()
+          if (sellerData?.error) {
+            throw new Error(sellerData.error?.data?.message || sellerData.error?.message || "Error buscando vendedor en Odoo")
+          }
+
+          const sellerRows = Array.isArray(sellerData?.result) ? sellerData.result : []
+          sellerId = sellerRows?.[0]?.id ?? null
+          sellerCache.set(email, sellerId)
+          console.log("Vendedor encontrado para email:", email, sellerId)
+        }
+      }
 
       // 🧠 Crear Lead
-      await fetch(`${ODOO_URL}/jsonrpc`, {
+      const leadPayload: Record<string, unknown> = {
+        name: `Lead - ${entry["1_Nombre"]}`,
+        contact_name: entry["1_Nombre"],
+        phone: entry["2_Telefono"],
+        description: entry["3_Descripcion"],
+        email_from: entry["5_EmailVendedor"],
+      }
+
+      if (hasEpicollectUuidField) {
+        leadPayload.x_epicollect_uuid = entry.ec5_uuid
+      }
+
+      if (sellerId) {
+        leadPayload.user_id = sellerId
+      }
+
+      const createRes = await fetch(`${ODOO_URL}/jsonrpc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -111,19 +228,17 @@ if (!entries.length) {
               ODOO_PASSWORD,
               "crm.lead",
               "create",
-              [{
-                name: `Lead - ${entry["1_Nombre"]}`,
-                contact_name: entry["1_Nombre"],
-                phone: entry["2_Telefono"],
-                description: entry["3_Descripcion"],
-                email_from: entry["5_EmailVendedor"],
-                x_epicollect_uuid: entry.ec5_uuid,
-              }],
+              [leadPayload],
             ],
           },
           id: 3,
         }),
       })
+
+      const createData = await createRes.json()
+      if (createData?.error) {
+        throw new Error(createData.error?.data?.message || createData.error?.message || "Error creando lead en Odoo")
+      }
 
       created++
     }
