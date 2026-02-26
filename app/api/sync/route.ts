@@ -26,11 +26,14 @@ export async function POST(req: NextRequest) {
     )
 
     const epiData = await epiRes.json()
-    const entries = epiData?.data?.entries || []
+    console.log("Datos recibidos de EpiCollect:", epiData)
+ const entries = epiData && epiData.data && Array.isArray(epiData.data.entries)
+  ? epiData.data.entries
+  : []
 
-    if (!entries.length) {
-      return NextResponse.json({ message: "No hay registros nuevos" })
-    }
+if (!entries.length) {
+  return NextResponse.json({ message: "No hay registros nuevos" })
+}
 
     // =============================
     // 2️⃣ Autenticación en Odoo
