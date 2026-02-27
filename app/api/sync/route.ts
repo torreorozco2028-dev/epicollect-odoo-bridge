@@ -17,8 +17,36 @@ export async function POST(req: NextRequest) {
       .from(`${process.env.EPI_USER}:${process.env.EPI_PASS}`)
       .toString("base64")
 
+    const now = new Date()
+    const todayStartUtc = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      0,
+      0,
+      0,
+      0
+    ))
+    const todayEndUtc = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      23,
+      59,
+      59,
+      999
+    ))
+
+    const toEc5Date = (date: Date) => date.toISOString().replace("Z", "")
+    const epiQuery = new URLSearchParams({
+      filter_by: "created_at",
+      filter_from: toEc5Date(todayStartUtc),
+      filter_to: toEc5Date(todayEndUtc),
+    })
+    const epiUrl = `https://five.epicollect.net/api/export/entries/torreorozco2028?${epiQuery.toString()}`
+
     const epiRes = await fetch(
-      "https://five.epicollect.net/api/export/entries/torreorozco2028",
+      epiUrl,
       {
         headers: { Authorization: `Basic ${epiAuth}` },
         cache: "no-store",
@@ -27,13 +55,32 @@ export async function POST(req: NextRequest) {
 
     const epiData = await epiRes.json()
     console.log("Datos recibidos de EpiCollect:", epiData)
- const entries = epiData && epiData.data && Array.isArray(epiData.data.entries)
-  ? epiData.data.entries
-  : []
-console.log("Entries extraídas:", entries)
-if ( !entries || entries.length < 1) {
-  return NextResponse.json({ message: "No hay registros nuevos" })
-}
+
+    const entriesRaw = epiData && epiData.data && Array.isArray(epiData.data.entries)
+      ? epiData.data.entries
+      : []
+
+    const entries = entriesRaw.filter((entry: Record<string, unknown>) => {
+      const rawDate = entry?.ec5_created_at ?? entry?.created_at
+      if (!rawDate || typeof rawDate !== "string") {
+        return false
+      }
+
+      const entryDate = new Date(rawDate)
+      if (Number.isNaN(entryDate.getTime())) {
+        return false
+      }
+
+      return entryDate >= todayStartUtc && entryDate <= todayEndUtc
+    })
+
+    console.log("URL EpiCollect filtrada por hoy:", epiUrl)
+    console.log("Entries extraídas (API):", entriesRaw.length)
+    console.log("Entries válidas para hoy:", entries.length)
+
+    if (!entries || entries.length < 1) {
+      return NextResponse.json({ message: "No hay registros nuevos" })
+    }
 
     // =============================
     // 2️⃣ Autenticación en Odoo
@@ -110,7 +157,7 @@ if ( !entries || entries.length < 1) {
 
       const email = entry?.["5_EmailVendedor"]
       const ec5Uuid = entry?.ec5_uuid
-
+ console.log("Entryyys:", entry)
       if (!ec5Uuid) {
         skippedWithoutUuid++
         continue
@@ -199,6 +246,7 @@ if ( !entries || entries.length < 1) {
         contact_name: entry["1_Nombre"],
         phone: entry["2_Telefono"],
         description: entry["3_Descripcion"],
+        probability:entry["4_Interes"],
         email_from: entry["5_EmailVendedor"],
       }
 
