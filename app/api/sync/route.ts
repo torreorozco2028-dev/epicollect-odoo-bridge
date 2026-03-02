@@ -242,7 +242,7 @@ export async function POST(req: NextRequest) {
 
       // 🧠 Crear Lead
       const leadPayload: Record<string, unknown> = {
-        name: `Lead - ${entry["1_Nombre"]}`,
+        name: `${entry["1_Nombre"]}`,
         contact_name: entry["1_Nombre"],
         phone: entry["2_Telefono"],
         description: entry["3_Descripcion"],
