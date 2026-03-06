@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
       filter_from: toEc5Date(todayStartUtc),
       filter_to: toEc5Date(todayEndUtc),
     })
-    const epiUrl = `https://five.epicollect.net/api/export/entries/torreorozco2028?${epiQuery.toString()}`
+    const epiUrl = `https://five.epicollect.net/api/export/entries/torreorozco2027?${epiQuery.toString()}`
 
     const epiRes = await fetch(
       epiUrl,
@@ -54,8 +54,6 @@ export async function POST(req: NextRequest) {
     )
 
     const epiData = await epiRes.json()
-    console.log("Datos recibidos de EpiCollect:", epiData)
-
     const entriesRaw = epiData && epiData.data && Array.isArray(epiData.data.entries)
       ? epiData.data.entries
       : []
@@ -73,11 +71,6 @@ export async function POST(req: NextRequest) {
 
       return entryDate >= todayStartUtc && entryDate <= todayEndUtc
     })
-
-    console.log("URL EpiCollect filtrada por hoy:", epiUrl)
-    console.log("Entries extraídas (API):", entriesRaw.length)
-    console.log("Entries válidas para hoy:", entries.length)
-
     if (!entries || entries.length < 1) {
       return NextResponse.json({ message: "No hay registros nuevos" })
     }
@@ -104,13 +97,12 @@ export async function POST(req: NextRequest) {
     })
 
     const authData = await authRes.json()
-    console.log("Autenticación en Odoo:", authData)
     const uid = authData.result
-
+ 
     if (!uid) {
       return NextResponse.json({ error: "Error autenticando en Odoo" }, { status: 401 })
     }
-
+   
     const fieldCheckRes = await fetch(`${ODOO_URL}/jsonrpc`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -135,12 +127,9 @@ export async function POST(req: NextRequest) {
     })
 
     const fieldCheckData = await fieldCheckRes.json()
-    console.log("Verificación del campo x_epicollect_uuid en Odoo:", fieldCheckData)
     const hasEpicollectUuidField = Boolean(
       fieldCheckData?.result && fieldCheckData.result.x_epicollect_uuid
     )
-    console.log("Campo x_epicollect_uuid disponible:", hasEpicollectUuidField)
-
     if (!hasEpicollectUuidField) {
       return NextResponse.json(
         { error: "El campo x_epicollect_uuid no existe en crm.lead" },
@@ -152,12 +141,12 @@ export async function POST(req: NextRequest) {
     let duplicated = 0
     let skippedWithoutUuid = 0
     const sellerCache = new Map<string, number | null>()
+    const partnerCache = new Map<string, number | null>()
 
     for (const entry of entries) {
 
-      const email = entry?.["5_EmailVendedor"]
+      const email = entry?.["6_EmailVendedor"]
       const ec5Uuid = entry?.ec5_uuid
- console.log("Entryyys:", entry)
       if (!ec5Uuid) {
         skippedWithoutUuid++
         continue
@@ -188,8 +177,6 @@ export async function POST(req: NextRequest) {
       })
 
       const checkData = await checkRes.json()
-      console.log("Verificación de duplicado:", checkData)
-
       if (checkData?.error) {
         throw new Error(checkData.error?.data?.message || checkData.error?.message || "Error verificando duplicado en Odoo")
       }
@@ -236,18 +223,117 @@ export async function POST(req: NextRequest) {
           const sellerRows = Array.isArray(sellerData?.result) ? sellerData.result : []
           sellerId = sellerRows?.[0]?.id ?? null
           sellerCache.set(email, sellerId)
-          console.log("Vendedor encontrado para email:", email, sellerId)
+        }
+      }
+
+      const contactName = typeof entry["2_Nombre"] === "string"
+        ? entry["2_Nombre"].trim()
+        : ""
+      const contactPhone = typeof entry["3_Telefono"] === "string"
+        ? entry["3_Telefono"].trim()
+        : ""
+
+      let partnerId: number | null = null
+      if (contactName && contactPhone) {
+        const partnerCacheKey = `${contactName.toLowerCase()}|${contactPhone}`
+
+        if (partnerCache.has(partnerCacheKey)) {
+          partnerId = partnerCache.get(partnerCacheKey) ?? null
+        } else {
+          const partnerSearchRes = await fetch(`${ODOO_URL}/jsonrpc`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              method: "call",
+              params: {
+                service: "object",
+                method: "execute_kw",
+                args: [
+                  ODOO_DB,
+                  uid,
+                  ODOO_PASSWORD,
+                  "res.partner",
+                  "search_read",
+                  [["&", ["name", "=", contactName], ["phone", "=", contactPhone]]],
+                  { fields: ["id"], limit: 1 },
+                ],
+              },
+              id: 30,
+            }),
+          })
+
+          const partnerSearchData = await partnerSearchRes.json()
+          if (partnerSearchData?.error) {
+            throw new Error(
+              partnerSearchData.error?.data?.message
+              || partnerSearchData.error?.message
+              || "Error buscando contacto en Odoo"
+            )
+          }
+
+          const partnerRows = Array.isArray(partnerSearchData?.result)
+            ? partnerSearchData.result
+            : []
+          partnerId = partnerRows?.[0]?.id ?? null
+
+          if (!partnerId) {
+            const partnerCreateRes = await fetch(`${ODOO_URL}/jsonrpc`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "call",
+                params: {
+                  service: "object",
+                  method: "execute_kw",
+                  args: [
+                    ODOO_DB,
+                    uid,
+                    ODOO_PASSWORD,
+                    "res.partner",
+                    "create",
+                    [{
+                      name: contactName,
+                      phone: contactPhone,
+                    }],
+                  ],
+                },
+                id: 31,
+              }),
+            })
+
+            const partnerCreateData = await partnerCreateRes.json()
+            if (partnerCreateData?.error) {
+              throw new Error(
+                partnerCreateData.error?.data?.message
+                || partnerCreateData.error?.message
+                || "Error creando contacto en Odoo"
+              )
+            }
+
+            partnerId = typeof partnerCreateData?.result === "number"
+              ? partnerCreateData.result
+              : null
+          }
+
+          partnerCache.set(partnerCacheKey, partnerId)
         }
       }
 
       // 🧠 Crear Lead
       const leadPayload: Record<string, unknown> = {
-        name: `${entry["1_Nombre"]}`,
-        contact_name: entry["1_Nombre"],
-        phone: entry["2_Telefono"],
-        description: entry["3_Descripcion"],
-        probability:entry["4_Interes"],
-        email_from: entry["5_EmailVendedor"],
+        name: `${entry["1_Titulo"]}`,
+        // `2_Nombre` de EpiCollect se sincroniza con `contact_name` en crm.lead.
+        contact_name: contactName,
+        partner_name: contactName,
+        phone: entry["3_Telefono"],
+        description: entry["4_Descripcion"],
+        probability: entry["5_Interes"],
+      }
+
+      if (partnerId) {
+        leadPayload.partner_id = partnerId
       }
 
       leadPayload.x_epicollect_uuid = ec5Uuid
